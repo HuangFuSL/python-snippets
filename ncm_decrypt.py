@@ -6,19 +6,30 @@
 依赖包：pycryptodomex
 
 参数格式：
-输入一个ncm文件路径或包含ncm的目录路径，省略则处理当前目录下的所有ncm文件
+path [path ...] [-o OUTPUT] [-f] [-r REGEX] [-e EXCLUDE] [-q] [-v]
+
+- path：ncm文件或目录
+- -o, --output：输出目录
+- -f, --force：覆盖已存在的文件
+- -r, --regex：匹配文件名的正则表达式
+- -e, --exclude：排除文件名的正则表达式
+- -q, --quiet：不打印处理信息
+- -v, --verbose：打印调试信息
 
 输出格式
 解码后的音频文件，mp3或flac格式
 '''
 from __future__ import annotations
 
+import argparse
 import base64
 import functools
 import io
 import json
+import logging
+import math
 import os
-import sys
+import re
 from typing import Tuple
 
 from Cryptodome.Cipher import AES
@@ -26,6 +37,25 @@ from Cryptodome.Cipher import AES
 NCM_FILEHEAD = b'CTENFDAM'
 NCM_COREKEY = b'hzHRAmso5kInbaxW'
 NCM_SIDEKEY = b"#14ljk_!\\]&0U<'("
+ARG_HELP = {
+    ('path', ): 'NCM file or directory',
+    ('-o', '--output'): 'Output directory',
+    ('-f', '--force'): 'Overwrite existing files',
+    ('-r', '--regex'): 'Regex to match filename',
+    ('-e', '--exclude'): 'Regex to exclude filename',
+    ('-q', '--quiet'): 'Do not print processing info',
+    ('-v', '--verbose'): 'Print debug info'
+}
+ARG_TEMPLATE = {
+    ('path', ): {'nargs': '*', 'default': '.'},
+    ('-o', '--output'): {'type': str, 'default': None},
+    ('-f', '--force'): {'action': 'store_true'},
+    ('-r', '--regex'): {'type': str, 'default': None},
+    ('-e', '--exclude'): {'type': str, 'default': None},
+    ('-q', '--quiet'): {'action': 'store_true'},
+    ('-v', '--verbose'): {'action': 'store_true'}
+}
+UNITS = ['B', 'KB', 'MB', 'GB', 'TB']
 
 
 def unpad(s: str | bytes):
@@ -79,15 +109,15 @@ def ncm_decrypt(data: io.BytesIO) -> Tuple[str, bytes]:
     ''' 解密ncm文件 '''
     core_key_chunk = read_chunk(data)
     decrypted = unpad(aes_decrypt(NCM_COREKEY, xor(core_key_chunk, 100)))[17:]
-    keybox = build_keybox(decrypted) # 用于文件主体的解密
+    keybox = build_keybox(decrypted)  # 用于文件主体的解密
 
-    b64_chunk = xor(read_chunk(data), 99) # 元数据部分
+    b64_chunk = xor(read_chunk(data), 99)  # 元数据部分
     b64_chunk_data = base64.b64decode(b64_chunk.split(b':', 1)[1])
     mdc = json.loads(unpad(aes_decrypt(NCM_SIDEKEY, b64_chunk_data)[6:]))
     file_name = '{musicName} - {artist[0][0]}.{format}'.format(**mdc)
 
     data.seek(9, 1)
-    image = read_chunk(data) # 专辑封面
+    _ = read_chunk(data)  # 专辑封面
     w = io.BytesIO()
     while True:
         chunk = data.read(32768)
@@ -98,21 +128,84 @@ def ncm_decrypt(data: io.BytesIO) -> Tuple[str, bytes]:
     return file_name, w.getvalue()
 
 
-def process_file(path: str, output_dir: str):
-    with open(path, 'rb') as f:
+def process_file(src: str, output_dir: str, force: bool = False) -> int:
+    with open(src, 'rb') as f:
         if f.read(8) != NCM_FILEHEAD:
             raise Exception('Not a NCM file')
         f.seek(2, 1)
         fn, data = ncm_decrypt(io.BytesIO(f.read()))
-    with open(os.path.join(output_dir, fn), 'wb') as f:
-        f.write(data)
+    dest = os.path.join(output_dir, fn.translate(
+        str.maketrans(r'\/:*?"<>|', '_' * 9)))
+    if force or not os.path.exists(dest):
+        logging.debug('    Processing %s', dest)
+        with open(dest, 'wb') as f:
+            f.write(data)
+        return len(data)
+
+    logging.debug('    Skipping %s', dest)
+    return 0
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else '.'
-    if os.path.isdir(path):
-        for _ in os.listdir(path):
-            if _.endswith('.ncm'):
-                process_file(os.path.join(path, _), path)
-    elif path.endswith('.ncm'):
-        process_file(path, os.path.dirname(path))
+    parser = argparse.ArgumentParser(description='NCM converter')
+    for args, msg in ARG_HELP.items():
+        parser.add_argument(*args, **ARG_TEMPLATE[args], help=msg)
+    ns = parser.parse_args()
+
+    levels = [logging.INFO, logging.ERROR, logging.DEBUG, logging.DEBUG]
+    logging.basicConfig(
+        level=levels[ns.quiet + ns.verbose * 2],
+        format='%(message)s',
+    )
+
+    logging.info('Path:')
+    for path in ns.path:
+        abspath = os.path.abspath(path)
+        if abspath.startswith(path) or path.startswith(abspath):
+            logging.info('    %s', path)
+        else:
+            logging.info('    %s (%s)', path, abspath)
+    logging.info('Output: %s', ns.output or 'Same as input')
+    logging.info('Force: %s', ns.force)
+    logging.info('Regex: %s', ns.regex or 'None')
+    logging.info('Exclude: %s', ns.exclude or 'None')
+    logging.info('Logging level: %s', logging.getLevelName(
+        logging.getLogger().level))
+
+    processed, skipped, size = 0, 0, 0
+
+    for path in ns.path:
+        for root, _, files in os.walk(path):
+            targets = [
+                _ for _ in files
+                if all([
+                    _.endswith('.ncm'),
+                    not ns.regex or re.search(ns.regex, _),
+                    not ns.exclude or not re.search(ns.exclude, _)
+                ])
+            ]
+            if targets:
+                logging.debug('Entering %s', root)
+                for file in targets:
+                    try:
+                        output_size = process_file(
+                            os.path.join(root, file), ns.output or root, ns.force
+                        )
+                        size += output_size
+                        if output_size:
+                            processed += 1
+                        else:
+                            skipped += 1
+                    except Exception as e:
+                        logging.error('Error processing %s: %s', file, e)
+                logging.debug('Leaving %s', root)
+    if size:
+        size_unit = min(int(math.log2(size) / 10), len(UNITS) - 1)
+        size_str = f'{size / 1024 ** size_unit:.2f}{UNITS[size_unit]}'
+    else:
+        size_str = '0B'
+        logging.warning('No files processed')
+    logging.info(
+        'Processed %d files, skipped %d files, total size %s',
+        processed, skipped, size_str
+    )
